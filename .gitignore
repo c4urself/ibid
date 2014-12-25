@@ -6,3 +6,5 @@
 /local.ini
 /logs/
 dropin.cache
+docs/_build
+twistd.pid
