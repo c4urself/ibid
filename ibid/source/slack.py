@@ -38,6 +38,7 @@ class WebSocketSlackProtocol(WebSocketClientProtocol):
     def onOpen(self):
         self.pingsReceived = 0
         self.pongsSent = 0
+        self.messageNumber = 0
 
     def onPing(self, payload):
         self.pingsReceived += 1
@@ -58,49 +59,86 @@ class WebSocketSlackProtocol(WebSocketClientProtocol):
         a utf8-encoded string or binary, check the latter via `isBinary`
         """
         log.debug(u'Received message via WSS')
-        if not isBinary:
-            payload = payload.decode('utf-8')
-            log.info(u'Text message received: {}'.format(payload))
 
-            try:
-                data = json.loads(payload)
-            except TypeError:
-                log.exception(u'Error parsing JSON response')
+        if isBinary:
+            return
 
-            if data['type'] == 'hello':
-                log.info(u'Successfully connected to Slack via WSS')
-            elif data['type'] == 'error':
-                self.handleError(data)
-            elif data['type'] == 'message':
-                if not data.get('subtype') == 'bot_message':
-                    channel_id = data['channel']
-                    raw_text = data['text']
-                    event = Event(u'slack', u'message')
-                    event.message = self.factory.clean_slack_msg(raw_text)
-                    event.channel = channel_id
-                    event.sender['id'] = self.factory.users[data['user']]['name']
-                    event.sender['connection'] = channel_id
-                    event.sender['nick'] = self.factory.users[data['user']]['name']
-                    log.debug(u'Got raw message: {}'.format(event.message))
-                    if channel_id[0] == 'D':
-                        event.public = False
-                        event.addressed = True
-                    else:
-                        event.public = True
-                        if re.search(r'<@{}>'.format(self.factory.user_id), raw_text):
-                            event.addressed = True
-                    ibid.dispatcher.dispatch(event).addCallback(self.respond)
+        payload = payload.decode('utf-8')
+        log.info(u'Text message received: {}'.format(payload))
+
+        try:
+            data = json.loads(payload)
+        except TypeError:
+            log.exception(u'Error parsing JSON response')
+
+        # Don't reply to acks
+        if data.get('ok') and data.get('reply_to'):
+            return
+
+        if data['type'] == 'hello':
+            log.info(u'Successfully connected to Slack via WSS')
+
+        elif data['type'] == 'error':
+            self.handleError(data)
+
+        # Ignore other bots
+        elif data['type'] == 'message' and data.get('subtype') != 'bot_message':
+
+            # Handle annoying diff versions of Slack servers
+            if 'message' in data:
+                sender = self.factory.users[data['message']['user']]['name']
+                text = data['message']['text']
+                is_edited = 'edited' in data['message']
+            else:
+                sender = self.factory.users[data['user']]['name']
+                text = data['text']
+                is_edited = 'edited' in data
+
+            # Ignore edits to sent messages
+            if is_edited:
+                log.info("Ignoring edited message")
+                return
+
+            channel_id = data['channel']
+            raw_text = text
+            event = Event(u'slack', u'message')
+            event.message = self.factory.clean_slack_msg(raw_text)
+            event.channel = channel_id
+            event.sender['id'] = sender
+            event.sender['connection'] = channel_id
+            event.sender['nick'] = sender
+            log.debug(u'Got raw message: {}'.format(event.message))
+            if channel_id[0] == 'D':
+                event.public = False
+                event.addressed = True
+            else:
+                event.public = True
+                if re.search(r'<@{}>'.format(self.factory.user_id), raw_text):
+                    event.addressed = True
+            ibid.dispatcher.dispatch(event).addCallback(self.parseResponse)
 
     def onClose(self, wasClean, code, reason):
         log.error(u'WebSocket connection closed: {0}'.format(reason))
 
-    def respond(self, event):
-        log.debug(u'Responding to event')
+    def parseResponse(self, event):
+        self.messageNumber += 1
+        log.debug(u'Responding to event via wss://')
         for response in event.responses:
-            self.factory.postMessageChat(event, response)
+            data = {
+                u'id': self.messageNumber,
+                u'type': u'message',
+                u'channel': response['target'],
+                u'text': response['reply'].encode('utf-8')
+            }
+            self.sendMessage(json.dumps(data), isBinary=False)
+
+    def respondHTTP(self, event):
+        log.debug(u'Responding to event via http://')
+        for response in event.responses:
+            self.factory.post_message(event, response)
 
 
-class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
+class SlackBot(WebSocketClientFactory):
 
     protocol = WebSocketSlackProtocol
 
@@ -143,7 +181,11 @@ class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
             contextFactory = None
         connectWS(self, contextFactory)
 
-    def onLogin(self, response_string):
+    def login(self):
+        log.debug(u'Attempting to authenticate')
+        self.call_API('rtm.start', cb=self.on_login)
+
+    def on_login(self, response_string):
         log.debug(u'Parsing authentication response')
         data = json.loads(response_string)
 
@@ -172,13 +214,13 @@ class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
                     name, _id = channel['name'], channel['id']
                     if name not in self.channels_to_join:
                         log.debug(u'Leaving channel {}'.format(name))
-                        self.leaveChannel(_id)
+                        self.leave(_id)
                     else:
                         self.channels.append(channel)
                         self.channels_to_join.remove(name)
             if self.channels_to_join:
                 for channel in self.channels_to_join:
-                    self.joinChannel(channel)
+                    self.join(channel)
 
             # Ensure we leave groups the admin hasn't explicitly
             # told us to be part of (cannot join groups)
@@ -186,7 +228,7 @@ class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
             for group in data['groups']:
                 name, _id = group['name'], group['id']
                 if name not in self.groups_to_join:
-                    self.leaveGroup(_id)
+                    self.leave_group(_id)
                 else:
                     self.groups.append(group)
 
@@ -211,20 +253,16 @@ class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
             log.error(u'Authentication failed.')
             self.ebHandleAPIError('error')
 
-    def formatAtUser(self, user_id):
-        name = self.users[user_id]['name']
-        return '<@{id}|{name}>'.format(id=user_id, name=name)
-
-    def cbHandleAPIResponse(self, response_string):
+    def handle_API_response(self, response_string):
         log.info(u'Received response: {}'.format(response_string))
 
-    def ebHandleAPIError(self):
+    def handle_API_error(self):
         log.error(u'Errback')
 
     def send(self, response):
-        self.postMessageChat(None, response)
+        self.post_message(None, response)
 
-    def postMessageChat(self, event, response):
+    def post_message(self, event, response):
         log.debug(event)
 
         params = {
@@ -232,34 +270,30 @@ class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
             u'channel': response['target'],
             u'username': ibid.config['botname'],
         }
-        self.callAPI('chat.postMessage', params=params)
+        self.call_API('chat.postMessage', params=params)
 
-    def login(self):
-        log.debug(u'Attempting to authenticate')
-        self.callAPI('rtm.start', cb=self.onLogin)
-
-    def joinChannel(self, name):
+    def join(self, name):
         log.info(u'Joining {}'.format(name))
-        self.callAPI('channels.join', cb=self.onJoinChannel, params={'name': name})
+        self.call_API('channels.join', cb=self.on_join_channel, params={'name': name})
 
-    def onJoinChannel(self, data):
+    def on_join_channel(self, data):
         if data['ok']:
             channel = data['channel']
             self.channels[channel['id']] = channel
         else:
-            self.ebHandleAPIError(data['error'])
+            self.handle_API_error(data['error'])
 
-    def leaveChannel(self, _id):
-        self.callAPI('channels.leave', params={'channel': _id})
+    def leave(self, _id):
+        self.call_API('channels.leave', params={'channel': _id})
         del self.channels[_id]
 
-    def leaveGroup(self, _id):
-        self.callAPI('groups.leave', params={'channel': _id})
+    def leave_group(self, _id):
+        self.call_API('groups.leave', params={'channel': _id})
         del self.groups[_id]
 
-    def callAPI(self, method, params=None, cb=None, eb=None):
-        cb = cb or self.cbHandleAPIResponse
-        eb = eb or self.ebHandleAPIError
+    def call_API(self, method, params=None, cb=None, eb=None):
+        cb = cb or self.handle_API_response
+        eb = eb or self.handle_API_error
 
         data = {
             'token': self.token
@@ -286,21 +320,8 @@ class SlackBot(WebSocketClientFactory, protocol.ReconnectingClientFactory):
                 .addCallback(cb) \
                 .addErrback(eb)
 
-    def disconnect(self):
-        log.info(u'Disconnecting')
-        self.stopTrying()
-        self.stopFactory()
 
-    def clientConnectionFailed(self, connector, reason):
-        print("Client connection failed .. retrying ..")
-        self.retry(connector)
-
-    def clientConnectionLost(self, connector, reason):
-        print("Client connection lost .. retrying ..")
-        self.retry(connector)
-
-
-class SourceFactory(IbidSourceFactory):
+class SourceFactory(IbidSourceFactory, protocol.ReconnectingClientFactory):
 
     auth = ('implicit',)
     supports = ('action', 'multiline', 'topic')
@@ -317,8 +338,12 @@ class SourceFactory(IbidSourceFactory):
     def setServiceParent(self, service):
         self.client.login()
 
+    def connect(self):
+        self.setServiceParent(None);
+
     def disconnect(self):
-        self.client.disconnect()
+        self.stopTrying()
+        self.stopFactory()
         return True
 
     def url(self):
