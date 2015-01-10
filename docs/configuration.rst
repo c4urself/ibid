@@ -310,6 +310,34 @@ Jabber Source
 
 .. _permissions:
 
+
+Slack Source
+"""""""""""""
+
+Counterintuively, you shouldn't create a bot integration for Slack. Instead
+create either a restricted user (for one channel or group) or a regular user
+for your bot. Then generate a token for it. NOTE: Slack requires autobahn
+as an added dependency.
+
+.. describe:: team:
+
+   **Required**
+   String: The Slack team to connect to. The Bot uses the ``team`` to connect
+   to the correct endpoint. ``http://api.<team>.slack.com``
+
+.. describe:: token
+
+   **Required**
+   String: The Slack token to use
+
+.. describe:: channels
+
+   List: List of channels names (without '#') to connect to
+
+.. describe:: groups
+
+   List: List of private groups that this bot should be in
+
 Permissions
 -----------
 
