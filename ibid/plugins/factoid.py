@@ -794,7 +794,7 @@ greetings = (
         u'hoezit', u'wotcha', u'wotcher', u'yo', u'word', u'good day',
         u'wasup', u'wassup', u'howzit', u'howsit', u'buon giorno',
         u'hoe lyk it', u'hoe gaan dit', u'good morning', u'morning',
-        u'afternoon', u'evening', u'goedemorgen'
+        u'afternoon', u'evening', u'goedemorgen',
 )
 static_default = {
     'greet': {
