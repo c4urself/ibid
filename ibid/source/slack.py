@@ -168,6 +168,13 @@ class SlackBot(WebSocketClientFactory):
                     msg = re.sub('<@{}>'.format(user_id), u'{}'.format(user_name), msg)
                 except:
                     log.error(user_id)
+        links = re.findall(r'(\<http.*\|([^>]+)\>)', msg)
+        if links:
+            for link in links:
+                try:
+                    msg = msg.replace(link[0], link[1])
+                except:
+                    log.exception(u'Failed to clean link')
         log.debug(u'Cleaned message is: {}'.format(msg))
         return msg
 
